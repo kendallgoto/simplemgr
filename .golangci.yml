@@ -1,0 +1,12 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: false
+
+linters:
+  exclusions:
+    rules:
+      - source: "^\\s*defer\\s+"
+        linters:
+          - errcheck
