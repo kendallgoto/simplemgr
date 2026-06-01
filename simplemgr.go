@@ -6,9 +6,13 @@
 package simplemgr
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -20,8 +24,18 @@ const DefaultTimeout = 3 * time.Second
 
 const readPollInterval = 50 * time.Millisecond
 
-// readDeadliner is implemented by devices that support a controllable read
-// timeout, allowing reads to avoid blocking indefinitely.
+// Framing selects the UART framing mode for a Port. See the smp package for the
+// behavior of each mode.
+type Framing = smp.Framing
+
+// Framing modes to use for message packing - different transports require different framing modes
+// see https://docs.zephyrproject.org/3.7.0/services/device_mgmt/smp_transport.html
+const (
+	PartialFrames = smp.PartialFrames
+	SingleFrames  = smp.SingleFrames
+	Unframed      = smp.Unframed
+)
+
 type readDeadliner interface {
 	SetReadTimeout(t time.Duration) error
 }
@@ -33,15 +47,22 @@ type Port struct {
 	Device io.ReadWriteCloser
 	// Timeout bounds each request/response exchange; zero disables it.
 	Timeout time.Duration
+	// Framing selects the type of frame to wrap around the messages, defaults to PartialFrames.
+	Framing Framing
+	// MaxFrameLen sets the max size for each frame, defaulting to SMP standard 127 bytes
+	MaxFrameLen int
 
 	seq uint8
+	rx  []byte // bytes read from Device but not yet consumed by the framer
 }
 
-// New creates a Port for the given device using DefaultTimeout.
+// New creates a Port for the given device using DefaultTimeout and default framing
 func New(device io.ReadWriteCloser) *Port {
 	return &Port{
-		Device:  device,
-		Timeout: DefaultTimeout,
+		Device:      device,
+		Timeout:     DefaultTimeout,
+		Framing:     PartialFrames,
+		MaxFrameLen: smp.DefaultMaxFrameLen,
 	}
 }
 
@@ -55,15 +76,14 @@ func (p *Port) writeAndRead(ctx context.Context, msg *smp.Message) (*smp.Message
 	msg.Seq = p.seq
 	p.seq++
 
-	framed, err := msg.MarshalBinary()
+	wire, err := smp.EncodeFrames(msg, p.Framing, p.MaxFrameLen)
 	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	_, err = p.Device.Write(framed)
-	if err != nil {
+	if _, err = p.Device.Write(wire); err != nil {
 		return nil, err
 	}
 
@@ -82,17 +102,8 @@ func (p *Port) writeAndRead(ctx context.Context, msg *smp.Message) (*smp.Message
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		encoded, err := p.readFrame(ctx)
-		if err != nil {
-			resultCh <- result{err: err}
-			return
-		}
-		resp := &smp.Message{}
-		if err := resp.UnmarshalBinary(encoded); err != nil {
-			resultCh <- result{err: fmt.Errorf("while reading response: %w", err)}
-			return
-		}
-		resultCh <- result{msg: resp}
+		resp, err := p.readMessage(ctx)
+		resultCh <- result{msg: resp, err: err}
 	}()
 
 	select {
@@ -107,14 +118,56 @@ func (p *Port) writeAndRead(ctx context.Context, msg *smp.Message) (*smp.Message
 	}
 }
 
-func (p *Port) readFrame(ctx context.Context) ([]byte, error) {
-	var (
-		body    []byte
-		buf     [256]byte
-		prev    byte
-		started bool
-	)
+func (p *Port) readMessage(ctx context.Context) (*smp.Message, error) {
+	if p.Framing == Unframed {
+		return p.readUnframed(ctx)
+	}
+
+	initial, content, err := p.readLine(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !initial {
+		return nil, fmt.Errorf("expected an initial frame, got a partial frame")
+	}
+	raw, err := base64.StdEncoding.DecodeString(string(content))
+	if err != nil {
+		return nil, fmt.Errorf("decode base64: %w", err)
+	}
+	if len(raw) < 2 {
+		return nil, fmt.Errorf("initial frame too short: %d bytes", len(raw))
+	}
+
+	// The initial frame leads with the total length of the body and CRC that
+	// follow; keep reading partial frames until that many bytes are gathered.
+	total := int(binary.BigEndian.Uint16(raw[:2]))
+	acc := slices.Clone(raw[2:])
+	for len(acc) < total {
+		more, content, err := p.readLine(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if more {
+			return nil, fmt.Errorf("unexpected initial frame mid-packet")
+		}
+		dec, err := base64.StdEncoding.DecodeString(string(content))
+		if err != nil {
+			return nil, fmt.Errorf("decode base64: %w", err)
+		}
+		acc = append(acc, dec...)
+	}
+	return smp.ParsePacket(acc[:total])
+}
+
+func (p *Port) readUnframed(ctx context.Context) (*smp.Message, error) {
+	var buf [256]byte
 	for {
+		if len(p.rx) >= 8 {
+			if msg, err := smp.NewMessage(p.rx); err == nil {
+				p.rx = nil
+				return msg, nil
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -122,19 +175,50 @@ func (p *Port) readFrame(ctx context.Context) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-
-		for _, b := range buf[:n] {
-			if !started {
-				if prev == 0x06 && b == 0x09 {
-					started = true
-				}
-				prev = b
-				continue
-			}
-			if b == '\n' {
-				return body, nil
-			}
-			body = append(body, b)
-		}
+		p.rx = append(p.rx, buf[:n]...)
 	}
+}
+
+func (p *Port) readLine(ctx context.Context) (initial bool, content []byte, err error) {
+	var buf [256]byte
+	for {
+		if init, body, ok := p.takeLine(); ok {
+			return init, body, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return false, nil, err
+		}
+		n, err := p.Device.Read(buf[:])
+		if err != nil {
+			return false, nil, err
+		}
+		p.rx = append(p.rx, buf[:n]...)
+	}
+}
+
+func (p *Port) takeLine() (initial bool, content []byte, ok bool) {
+	for i := 0; i+1 < len(p.rx); i++ {
+		init := p.rx[i] == 0x06 && p.rx[i+1] == 0x09
+		part := p.rx[i] == 0x04 && p.rx[i+1] == 0x14
+		if !init && !part {
+			continue
+		}
+		rest := p.rx[i+2:]
+		nl := bytes.IndexByte(rest, '\n')
+		if nl < 0 {
+			// Marker seen but the line is incomplete; drop preceding junk and
+			// wait for the rest of the line.
+			p.rx = slices.Clone(p.rx[i:])
+			return false, nil, false
+		}
+		content = slices.Clone(rest[:nl])
+		p.rx = slices.Clone(rest[nl+1:])
+		return init, content, true
+	}
+	// No marker found; retain only a trailing byte that might begin a marker
+	// split across reads.
+	if len(p.rx) > 1 {
+		p.rx = slices.Clone(p.rx[len(p.rx)-1:])
+	}
+	return false, nil, false
 }

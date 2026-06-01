@@ -167,15 +167,15 @@ func DecodeMessageBody(msg *Message, out any) error {
 	return nil
 }
 
-// MarshalBinary encodes the message into its framed UART form: a base64-wrapped
-// body with a length prefix and CRC suffix. It implements encoding.BinaryMarshaler.
-func (msg *Message) MarshalBinary() ([]byte, error) {
+// packet builds the framed packet payload: a 2-byte big-endian length prefix
+// (covering the body and CRC that follow), the message body, and a 2-byte
+// CRC16-XMODEM over that body.
+func (msg *Message) packet() ([]byte, error) {
 	body, err := msg.Bytes_()
 	if err != nil {
 		return nil, fmt.Errorf("while packing smp message: %v", err)
 	}
 
-	// Build the packet: 2-byte length prefix + body + 2-byte CRC (XMODEM).
 	packet := make([]byte, len(body)+4)
 	binary.BigEndian.PutUint16(packet, uint16(len(body)+2))
 	copy(packet[2:], body)
@@ -184,16 +184,18 @@ func (msg *Message) MarshalBinary() ([]byte, error) {
 		return nil, fmt.Errorf("while computing crc: %w", err)
 	}
 	copy(packet[len(body)+2:], w.Sum(nil))
+	return packet, nil
+}
 
-	// The packet is base64 wrapped, prefixed with the 0x0609 non-fragmented
-	// start-of-frame marker and terminated by a newline.
-	encoded := base64.StdEncoding.EncodeToString(packet)
-	frame := make([]byte, 2+base64.StdEncoding.EncodedLen(len(packet))+1)
-	frame[0] = 0x06
-	frame[1] = 0x09
-	copy(frame[2:], encoded)
-	frame[len(frame)-1] = '\n'
-	return frame, nil
+// MarshalBinary encodes the message into a single framed UART line: a
+// base64-wrapped packet behind the 0x0609 initial-final marker. It implements
+// encoding.BinaryMarshaler and is equivalent to EncodeFrames in SingleFrames mode.
+func (msg *Message) MarshalBinary() ([]byte, error) {
+	packet, err := msg.packet()
+	if err != nil {
+		return nil, err
+	}
+	return wrapFrame(0x06, 0x09, packet), nil
 }
 
 // UnmarshalBinary decodes a framed UART line into the message. It strips any
