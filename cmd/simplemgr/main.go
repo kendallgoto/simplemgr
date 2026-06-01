@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -350,8 +349,11 @@ func newImageCmd() *cobra.Command {
 			}
 
 			if sendHash || confirmImage || testImage {
-				sum := sha256.Sum256(data)
-				cfg.Hash = sum[:]
+				hash, err := simplemgr.ImageHash(bytes.NewReader(data))
+				if err != nil {
+					return err
+				}
+				cfg.Hash = hash
 			}
 			if imageNum >= 0 {
 				cfg.Image = goutil.Ptr(uint32(imageNum))

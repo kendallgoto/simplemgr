@@ -2,12 +2,23 @@ package simplemgr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
 	goutil "github.com/kendallgoto/goutil"
+	"github.com/kendallgoto/simplemgr/pkg/dfu"
 	"github.com/kendallgoto/simplemgr/pkg/smp"
 )
+
+// Read the MCUboot TLVs to find IMAGE_TLV_SHA256 hash
+func ImageHash(r io.ReadSeeker) ([]byte, error) {
+	h, err := dfu.GetHashFromTLV(r)
+	if err != nil {
+		return nil, fmt.Errorf("reading mcuboot image hash TLV: %w", err)
+	}
+	return h, nil
+}
 
 // Amount to upload in a single SMP message
 const DefaultDFUChunkSize = 128
@@ -170,6 +181,9 @@ func (d *DFU) Close() error {
 		// Confirm makes the image permanent; otherwise mark it for a single test
 		// boot. The image hash identifies which slot to act on.
 		if _, err := d.port.SetImageState(d.ctx, d.cfg.Hash, d.cfg.Confirm); err != nil {
+			if errors.Is(err, smp.ErrNotFound) {
+				return fmt.Errorf("dfu: setting image state: %w (no pending image with hash)", err)
+			}
 			return fmt.Errorf("dfu: setting image state: %w", err)
 		}
 	}
