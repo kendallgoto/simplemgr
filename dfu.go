@@ -174,7 +174,7 @@ func (d *DFU) Close() error {
 		}
 	}
 	if d.offset != d.cfg.Length {
-		return fmt.Errorf("dfu: upload incomplete, device acknowledged %d of %d bytes", d.offset, d.cfg.Length)
+		return fmt.Errorf("closed too early, upload incomplete. device only acknowledged %d of %d bytes", d.offset, d.cfg.Length)
 	}
 
 	if d.cfg.Confirm || d.cfg.Test {
@@ -182,14 +182,14 @@ func (d *DFU) Close() error {
 		// boot. The image hash identifies which slot to act on.
 		if _, err := d.port.SetImageState(d.ctx, d.cfg.Hash, d.cfg.Confirm); err != nil {
 			if errors.Is(err, smp.ErrNotFound) {
-				return fmt.Errorf("dfu: setting image state: %w (no pending image with hash)", err)
+				return fmt.Errorf("failed setting image state: %w (no pending image with hash)", err)
 			}
-			return fmt.Errorf("dfu: setting image state: %w", err)
+			return fmt.Errorf("failed setting image state: %w", err)
 		}
 	}
 	if d.cfg.Reset {
 		if _, err := d.port.Reset(d.ctx, 0); err != nil {
-			return fmt.Errorf("dfu: resetting device: %w", err)
+			return fmt.Errorf("failed resetting device: %w", err)
 		}
 	}
 	return nil
